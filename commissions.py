@@ -2,7 +2,8 @@ from system.lib import minescript
 from system.lib.java import JavaClass
 from detector import Detection
 from rotation import look #I preferred this one since i like it better, your choice tho
-from ThetaStar import path_walk_to
+from ThetaStar import path_walk_to, path_find
+from blockRenderer import render_blocks, stop_rendering
 from raycast import raycast_block_subregions
 import threading, time, math, random
 
@@ -17,6 +18,10 @@ BLOCK_LIST = [
     "minecraft:prismarine",
     "minecraft:polished_diorite"
         ]
+
+def path_helper(path):
+    return [(x, y-1, z) for x, y, z in path]
+
 
 #Get the commissions from the tablist
 def get_commissions():
@@ -59,9 +64,15 @@ def travel_to_commission():
         return
     #helpers
     def warp(area_name):
-        for wx, wy, wz in EATHER_WARPS.get(area_name, []):
+        positions = EATHER_WARPS.get(area_name, [])
+        if not positions:
+            return
+        render_blocks(positions)
+
+        for wx, wy, wz in positions:
             minescript.player_press_sneak(True)
             time.sleep(0.2)
+
             px, py, pz = minescript.player_position()
             rays = raycast_block_subregions((px, py+1.52, pz), (wx, wy, wz), max_dist=500, rays_per_axis=4)
             if rays:
@@ -70,20 +81,28 @@ def travel_to_commission():
                 print(f"Looked at warp {wx, wy, wz}")
             else:
                 print(f"No ray hit for warp {wx, wy, wz}")
+
             minescript.player_press_use(True)
             time.sleep(0.1)
             minescript.player_press_use(False)
             minescript.player_press_sneak(False)
             time.sleep(0.5)
+        stop_rendering()
 
     def go(area_name, pre_points=(), go_to_area=True):
         for point in pre_points:
-            path_walk_to(point)
+            path = path_find(minescript.player_position(), point)
+            render_blocks(path_helper(path))
+            path_walk_to(path)
+            stop_rendering()
             time.sleep(0.1)
         if go_to_area:
             for pos, name in AREA_LIST.items():
                 if name == area_name:
-                    path_walk_to(pos)
+                    path = path_find(minescript.player_position(), pos)
+                    render_blocks(path_helper(path))
+                    path_walk_to(path)
+                    stop_rendering()
                     return
 
 
@@ -131,6 +150,7 @@ def claim_commissions():
             time.sleep(0.5)
         except:
             pass
+
 #mob commissions
 def kill_commission():
     #get the commissions
@@ -215,14 +235,12 @@ def kill_commission():
         current_look[0] = None
     stop_look_thread()
 
-
 #mining loop
 def mining():
     #make 2 block lists 1 always updating so that when we run out of blocks in the main one we have the other list to fall back on
     available_blocks, available_angles = [], []
     current_blocks, current_angles = [], []
-    detector = Detection(BLOCK_LIST, 4, 25)
-    #threaded scanner
+    detector = Detection(BLOCK_LIST, 3, 25)
     def scan_blocks():
         nonlocal available_blocks, available_angles
         while True:
@@ -231,21 +249,25 @@ def mining():
             blocks, angles = detector.locate_blocks()
             if blocks: available_blocks[:] = blocks
             if angles: available_angles[:] = angles
-            time.sleep(0.5)
+            time.sleep(1.5)
     threading.Thread(target=scan_blocks, daemon=True).start()
-    #main loop
     while True:
         if not current_blocks and available_blocks:
             current_blocks[:] = available_blocks[:]
             current_angles[:] = available_angles[:]
+            render_blocks(current_blocks)
         while current_blocks:
             block = current_blocks.pop(0)
             angles_for_block = current_angles.pop(0)
             if minescript.get_block(*block) not in BLOCK_LIST:
+                stop_rendering(remove_blocks=[block])
                 continue
             yaw, pitch = angles_for_block[0]
             look(yaw, pitch)
             while minescript.get_block(*block) in BLOCK_LIST:
                 minescript.player_press_attack(True)
+                time.sleep(0.01)
+            # Remove the block from the render immediately
+            stop_rendering(remove_blocks=[block])
         time.sleep(0.05)
-kill_commission()
+claim_commissions()
