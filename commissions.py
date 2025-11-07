@@ -4,7 +4,7 @@ from detector import Detection
 from rotation import look #I preferred this one since i like it better, your choice tho
 from ThetaStar import path_walk_to
 from raycast import raycast_block_subregions
-import threading, time, math
+import threading, time, math, random
 
 ClickType = JavaClass("net.minecraft.world.inventory.ClickType")
 Minecraft = JavaClass("net.minecraft.client.Minecraft")
@@ -131,23 +131,90 @@ def claim_commissions():
             time.sleep(0.5)
         except:
             pass
-
+#mob commissions
 def kill_commission():
+    #get the commissions
     commissions = get_commissions()
-    target_type = next((t for c in commissions for t in ["Glacite Walker", "Goblin"] if t in c.strip()), None)
-    target_type = "Glacite Walker"
+    target_type = next((t for c in commissions for t in ["Ice Walker", "Goblin"] if t in c.strip()), None)
     if not target_type:
         return
+    #thread safety
+    look_lock = threading.Lock()
+    current_look = [None]
+    look_thread = [None]
+    look_thread_running = [False]
+    #get the yaw, pitch for the mob
+    def calc_look(px, py, pz, ex, ey, ez):
+        py += 1.62
+        dx, dy, dz = ex - px, ey - py, ez - pz
+        dist_xz = math.sqrt(dx*dx + dz*dz)
+        yaw = math.degrees(math.atan2(-dx, dz))
+        pitch = math.degrees(-math.atan2(dy, dist_xz))
+        return yaw, pitch
+    #thread safety
+    def thread_look():
+        look_thread_running[0] = True
+        while look_thread_running[0]:
+            with look_lock:
+                target = current_look[0]
+            if target:
+                yaw, pitch = target
+                look(yaw, pitch)
+            else:
+                time.sleep(0.05)
+            time.sleep(0.01)
+
+    def start_look_thread():
+        if look_thread[0] is None or not look_thread[0].is_alive():
+            look_thread[0] = threading.Thread(target=thread_look, daemon=True)
+            look_thread[0].start()
+
+    def stop_look_thread():
+        look_thread_running[0] = False
+
+    start_look_thread()
+
     available_entities = []
     target_entities = minescript.entities(max_distance=100)
 
     for t_entity in target_entities:
         if target_type in t_entity.name:
             available_entities.append(t_entity)
+    #get closest entity(not really working)
+    px, py, pz = minescript.player_position()
+    available_entities.sort(key=lambda e: (e.position[0]-px)**2 + (e.position[1]-py)**2 + (e.position[2]-pz)**2)
 
     for entity in available_entities:
-        while entity.health > 0.1:
-            path_walk_to(entity.position)
+        while True:
+            entities = minescript.entities(max_distance=100)
+            live = next((e for e in entities if e.uuid == entity.uuid), None)
+            if not live or live.health <= 0:
+                with look_lock:
+                    current_look[0] = None
+                break
+
+            px, py, pz = minescript.player_position()
+            ex, ey, ez = live.position
+            dist_sq = (px - ex) ** 2 + (py - ey) ** 2 + (pz - ez) ** 2
+
+            if dist_sq > 3:
+                path_walk_to(live.position, distance=1.5)
+                with look_lock:
+                    current_look[0] = None
+            else:
+                yaw, pitch = calc_look(px, py, pz, ex, ey, ez)
+                with look_lock:
+                    current_look[0] = (yaw, pitch)
+
+                minescript.player_press_attack(True)
+                time.sleep(1 / random.uniform(8, 11))
+                minescript.player_press_attack(False)
+
+            time.sleep(0.05)
+    with look_lock:
+        current_look[0] = None
+    stop_look_thread()
+
 
 #mining loop
 def mining():
