@@ -20,3 +20,6 @@ Warps - For warps, we also use a raycasting system to determine the correct posi
 ## Kill Commissions
 
 While this isn't perfect, it works. This will change in the future — currently, we're using a static pathfinder, but this is expected to improve over time.
+
+## Credits
+Pathfinder & rotation: https://github.com/Jones0073/AShortPath
