@@ -1,0 +1,743 @@
+import minescript
+import math, heapq, threading, time
+from rotation import look
+from itertools import count
+from concurrent.futures import ThreadPoolExecutor
+
+EXECUTOR = ThreadPoolExecutor(max_workers=25)
+
+AIRLIKE = {"minecraft:air", "minecraft:light"}
+LIQUIDS = {"minecraft:water", "minecraft:lava"}
+IGNORE_BLOCKS = {
+    "minecraft:air", "minecraft:oak_sign", "minecraft:poppy", "minecraft:torch",
+    "minecraft:vine", "minecraft:short_grass", "minecraft:short_dry_grass", "minecraft:tall_grass", "minecraft:sugar_cane",
+    "minecraft:tall_dry_grass", "minecraft:snow", "minecraft:oak_sapling", "minecraft:stone_button", "minecraft:heavy_weighted_pressure_plate",
+    "minecraft:tripwire_hook", "minecraft:firefly_bush", "minecraft:dandelion", "minecraft:bush"
+}
+
+UNWALKABLE = {"minecraft:slime_block"}
+MAX_VERTICAL_STEP = 1
+EYE_HEIGHT = 1.62
+BODY_RADIUS = 0.3        # ~player half-width
+BODY_SAMPLE_LEVELS = (0.2, 0.9, 1.5)  # feet->shoulder samples for body LOS
+ENTITY_HEIGHT = 1.8      # player/capsule height
+
+
+# ---- Utilities --------------------------------------------------------------
+
+def is_bottom_slab(b: str) -> bool:
+    """True for bottom (non-double) slabs (pass-through headroom logic)."""
+    return ("slab" in b) and ("double" not in b) and (
+        "bottom" in b or "type=bottom" in b or "_bottom" in b
+    )
+
+def is_passable(block_id: str) -> bool:
+    """
+    Occupancy test: can the player's body occupy this block space?
+    Air, ignorable thin blocks, and *bottom slabs* are passable.
+    (Full blocks, liquids, top slabs, etc. are not.)
+    """
+    if not block_id:
+        return True
+    b = block_id.lower()
+    if b in AIRLIKE:
+        return True
+    if b in IGNORE_BLOCKS:
+        return True
+    if is_bottom_slab(b):
+        return True
+    return False
+
+def is_supportive(block_id: str) -> bool:
+    """
+    Floor support test: can you stand on this block?
+    Supportive if solid OR bottom slab (half-block floor).
+    Liquids and thin deco do NOT count as support.
+    """
+    if not block_id:
+        return False
+    b = block_id.lower()
+    if b in LIQUIDS or b in AIRLIKE:
+        return False
+    if b in IGNORE_BLOCKS:
+        return False
+    if b in UNWALKABLE:
+        return False
+    # bottom slab works as a (half-height) floor
+    if is_bottom_slab(b):
+        return True
+    # anything else that's not airlike/ignorable/liquid is solid
+    return True
+
+def get_block(x, y, z, cache):
+    key = (x, y, z)
+    if key not in cache:
+        cache[key] = minescript.getblock(x, y, z)
+    return cache[key]
+
+def has_clearance(x, y, z, cache) -> bool:
+    """Player clearance: body block + head block must both be passable."""
+    current = get_block(x, y, z, cache)
+    above   = get_block(x, y + 1, z, cache)
+    return is_passable(current) and is_passable(above)
+
+def LOS(start, end, cache) -> bool:
+    x0, y0, z0 = start
+    x1, y1, z1 = end
+    EXACT_IGNORES = IGNORE_BLOCKS if isinstance(IGNORE_BLOCKS, set) else set(IGNORE_BLOCKS)
+    PREFIX_IGNORES = tuple()
+    def is_airlike(b): return b in AIRLIKE
+    def is_ignored(b): return b in EXACT_IGNORES or b.startswith(PREFIX_IGNORES)
+    def is_solid(b):
+        if not b: return False
+        b = b.lower()
+        if is_airlike(b) or is_ignored(b): return False
+        return True
+    def cell_blocks_eye(gx, gy, gz, t_here, t_next, sy, dy):
+        block = get_block(gx, gy, gz, cache)
+        if not block: return False
+        b = block.lower()
+        if is_airlike(b) or is_ignored(b): return False
+        if is_bottom_slab(b):
+            t_sample = min(t_next, 1.0) - 1e-6
+            if t_sample < t_here: t_sample = t_here + 1e-6
+            y_at = sy + dy * t_sample
+            if y_at - math.floor(y_at) > 0.8: return False
+        return True
+    def cell_blocks_body(gx, gy, gz): return is_solid(get_block(gx, gy, gz, cache))
+    def ray_clear(sx, sy, sz, ex, ey, ez, for_eye):
+        dx, dy, dz = ex - sx, ey - sy, ez - sz
+        if dx == dy == dz == 0: return True
+        l = math.sqrt(dx*dx + dy*dy + dz*dz)
+        nx, ny, nz = dx/l, dy/l, dz/l
+        sx += nx*1e-6; sy += ny*1e-6; sz += nz*1e-6
+        gx, gy, gz = math.floor(sx), math.floor(sy), math.floor(sz)
+        gx1, gy1, gz1 = math.floor(ex), math.floor(ey), math.floor(ez)
+        sxp = 1 if dx > 0 else -1 if dx < 0 else 0
+        syp = 1 if dy > 0 else -1 if dy < 0 else 0
+        szp = 1 if dz > 0 else -1 if dz < 0 else 0
+        inf = float('inf')
+        tMaxX = ((gx + (sxp > 0)) - sx) / dx if sxp else inf
+        tMaxY = ((gy + (syp > 0)) - sy) / dy if syp else inf
+        tMaxZ = ((gz + (szp > 0)) - sz) / dz if szp else inf
+        tDeltaX = abs(1.0 / dx) if sxp else inf
+        tDeltaY = abs(1.0 / dy) if syp else inf
+        tDeltaZ = abs(1.0 / dz) if szp else inf
+        t_here = 0.0
+        while True:
+            if for_eye:
+                if cell_blocks_eye(gx, gy, gz, t_here, min(tMaxX, tMaxY, tMaxZ), sy, dy): return False
+            else:
+                if cell_blocks_body(gx, gy, gz): return False
+            if tMaxX < tMaxY and tMaxX < tMaxZ:
+                gx += sxp; t_here = tMaxX; tMaxX += tDeltaX
+            elif tMaxY < tMaxZ:
+                gy += syp; t_here = tMaxY; tMaxY += tDeltaY
+            else:
+                gz += szp; t_here = tMaxZ; tMaxZ += tDeltaZ
+            if gx == gx1 and gy == gy1 and gz == gz1:
+                if for_eye:
+                    if cell_blocks_eye(gx, gy, gz, t_here, 1.0, sy, dy): return False
+                else:
+                    if cell_blocks_body(gx, gy, gz): return False
+                break
+            if t_here > 1.0 + 1e-6: break
+        return True
+    def offsets_for_radius(r): return [(-r, -r), (-r, r), (r, -r), (r, r), (0, 0)]
+    eye_y0 = y0 + EYE_HEIGHT
+    eye_y1 = y1 + EYE_HEIGHT
+    eye_tasks = [EXECUTOR.submit(ray_clear, x0+ox, eye_y0, z0+oz, x1+ox, eye_y1, z1+oz, True) for ox, oz in offsets_for_radius(0.25)]
+    for f in eye_tasks:
+        if not f.result(): return False
+    body_tasks = []
+    for h in BODY_SAMPLE_LEVELS:
+        sy, ey = y0 + h, y1 + h
+        for ox, oz in offsets_for_radius(BODY_RADIUS):
+            body_tasks.append(EXECUTOR.submit(ray_clear, x0+ox, sy, z0+oz, x1+ox, ey, z1+oz, False))
+    for f in body_tasks:
+        if not f.result(): return False
+    def find_floor_y(bx, y_hint, bz):
+        yh = int(math.floor(y_hint))
+        for d in range(0, 4):
+            yy = yh - d
+            if is_solid(get_block(bx, yy, bz, cache)): return yy
+        for d in range(1, 4):
+            yy = yh + d
+            if is_solid(get_block(bx, yy, bz, cache)): return yy
+        return None
+    def has_clearance_from_floor(bx, floor_y, height):
+        top_needed = floor_y + math.ceil(height)
+        for yy in range(floor_y + 1, top_needed + 1):
+            b = get_block(bx, yy, bz, cache)
+            if b and not is_airlike(b.lower()) and not is_ignored(b.lower()): return False
+        return True
+    dx, dz = x1 - x0, z1 - z0
+    steps = max(1, int(math.ceil(max(abs(dx), abs(dz)))))
+    prev_floor_top = None
+    for i in range(1, steps + 1):
+        t = i / float(steps)
+        xi, zi = x0 + dx * t, z0 + dz * t
+        yi_hint = y0 + (y1 - y0) * t
+        worst_step_ok = True
+        futures = []
+        for ox, oz in offsets_for_radius(BODY_RADIUS):
+            bx, bz = int(math.floor(xi + ox)), int(math.floor(zi + oz))
+            futures.append(EXECUTOR.submit(find_floor_y, bx, yi_hint, bz))
+        floor_vals = [f.result() for f in futures]
+        for idx, floor_y in enumerate(floor_vals):
+            if floor_y is None: return False
+            ox, oz = offsets_for_radius(BODY_RADIUS)[idx]
+            bx, bz = int(math.floor(xi + ox)), int(math.floor(zi + oz))
+            if not has_clearance_from_floor(bx, floor_y, ENTITY_HEIGHT): return False
+            floor_top = floor_y + 1.0
+            if prev_floor_top is not None and abs(floor_top - prev_floor_top) > MAX_VERTICAL_STEP + 1e-6:
+                worst_step_ok = False
+            prev_floor_top = floor_top
+        if not worst_step_ok: return False
+    return True
+
+# ---- A* Node ---------------------------------------------------------------
+
+HEURISTIC_WEIGHT = 1.5  # set slightly >1.0 to be greedier if desired (e.g., 1.05)
+# TODO: really high right now to cut time on long distances by alot (60-70% speedup)
+
+class Node:
+    __slots__ = ("pos","parent","G","H")
+    def __init__(self, pos, parent=None):
+        self.pos = tuple(map(math.floor, pos))
+        self.parent = parent
+        self.G = 0.0
+        self.H = 0.0
+
+    @property
+    def F(self):
+        return self.G + HEURISTIC_WEIGHT * self.H
+
+    def __lt__(self, other):
+        # Not relied upon (we tie-break in heap entries), but keep deterministic:
+        return (self.F, self.H, self.pos) < (other.F, other.H, other.pos)
+
+    def heuristic(self, goal):
+        px, py, pz = self.pos
+        gx, gy, gz = goal
+        return math.sqrt((px - gx)**2 + (py - gy)**2 + (pz - gz)**2)
+
+    def _diagonal_clearance_ok(self, cx, cy, cz, nx, ny, nz, cache) -> bool:
+        dx, dy, dz = nx - cx, ny - cy, nz - cz
+
+        # Only care when there's a diagonal component in XZ.
+        if abs(dx) == 1 and abs(dz) == 1:
+            base_y = min(cy, ny)
+
+            if dy > 0:
+                # Step UP by 1: allow a solid riser at (nx, cy, nz).
+                # Require the other orthogonal column to be clear so we don't corner-cut.
+                if not has_clearance(cx, base_y, cz + dz, cache):
+                    return False
+            else:
+                # Same level or stepping down: both orthogonal adjacents must be clear.
+                if not has_clearance(cx + dx, base_y, cz, cache):
+                    return False
+                if not has_clearance(cx, base_y, cz + dz, cache):
+                    return False
+
+        # No extra checks for cardinal moves or pure vertical; existing checks suffice.
+        return True
+
+
+    def is_walkable(self, pos, cache) -> bool:
+        nx, ny, nz = pos
+        cx, cy, cz = self.pos
+        dy = ny - cy
+
+        if abs(dy) > MAX_VERTICAL_STEP:
+            return False
+
+        below = get_block(nx, ny - 1, nz, cache)
+        if not is_supportive(below):
+            return False
+
+        # Body + head clearance at target
+        if not has_clearance(nx, ny, nz, cache):
+            return False
+        
+        # If stepping UP, we also need headroom above current position to rise into
+        if dy > 0 and not has_clearance(cx, cy + 1, cz, cache):
+            return False
+
+        # Corner-cut prevention applies to ALL moves (same-level and step up/down).
+        if not self._diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
+            return False
+
+        return True
+
+    def neighbors(self, cache):
+        x, y, z = self.pos
+        result = []
+        dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+        def check_dir(dx, dz):
+            if self.is_walkable((x+dx,y,z+dz),cache): return (x+dx,y,z+dz)
+            if MAX_VERTICAL_STEP>=1 and self.is_walkable((x+dx,y+1,z+dz),cache): return (x+dx,y+1,z+dz)
+            if MAX_VERTICAL_STEP>=1 and self.is_walkable((x+dx,y-1,z+dz),cache): return (x+dx,y-1,z+dz)
+            return None
+        futures=[EXECUTOR.submit(check_dir,dx,dz) for dx,dz in dirs]
+        for f in futures:
+            r=f.result()
+            if r: result.append(r)
+        return result
+
+
+# ---- Helpers ---------------------------------------------------------------
+
+def reconstruct_path(node):
+    path = []
+    while node:
+        path.append(node.pos)
+        node = node.parent
+    return path[::-1]
+
+def smooth_path(path, cache):
+    """Simple string-pulling using LOS; keeps endpoints."""
+    if len(path) <= 2:
+        return path
+    smoothed = [path[0]]
+    anchor = 0
+    for i in range(2, len(path)):
+        if not LOS(path[anchor], path[i], cache):
+            smoothed.append(path[i - 1])
+            anchor = i - 1
+    smoothed.append(path[-1])
+    return smoothed
+
+# ---- Pathfinding -----------------------------------------------------------
+
+def path_find(start, goal, do_smooth=True):
+    start_time = time.time()
+    start = tuple(map(math.floor, start))
+    goal  = tuple(map(math.floor, goal))
+
+    cache = {}
+    start_node = Node(start)
+    start_node.H = start_node.heuristic(goal)
+
+    # (F, H, tie, Node) — tie breaker keeps heap operations predictable
+    pq = []
+    _tie = count()
+    heapq.heappush(pq, (start_node.F, start_node.H, next(_tie), start_node))
+
+    closed = set()
+    node_map = {start: start_node}
+
+    while pq:
+        _, _, _, current = heapq.heappop(pq)
+        if current.pos in closed:
+            continue
+
+        if current.pos == goal:
+            raw_path = reconstruct_path(current)
+            final_path = smooth_path(raw_path, cache) if do_smooth else raw_path
+            dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(goal, start)))
+            minescript.echo(
+                f"Pathfinding took {time.time() - start_time:.3f}s | "
+                f"Nodes: {len(final_path)} | Distance: {dist:.2f}"
+            )
+            return final_path
+
+        closed.add(current.pos)
+
+        for npos in current.neighbors(cache):
+            if npos in closed:
+                continue
+
+            # LOS-based parent shortcut (Theta*-style)
+            if current.parent and current.parent.pos[1] == npos[1] and LOS(current.parent.pos, npos, cache):
+                parent_candidate = current.parent
+                base = parent_candidate.pos
+            else:
+                parent_candidate = current
+                base = current.pos
+
+            step_cost = math.sqrt(sum((a - b) ** 2 for a, b in zip(base, npos)))
+            tentative_G = parent_candidate.G + step_cost
+
+            neighbor = node_map.get(npos)
+            if neighbor is None:
+                neighbor = Node(npos, parent_candidate)
+                neighbor.G = tentative_G
+                neighbor.H = neighbor.heuristic(goal)
+                node_map[npos] = neighbor
+                heapq.heappush(pq, (neighbor.F, neighbor.H, next(_tie), neighbor))
+            elif tentative_G + 1e-9 < neighbor.G:
+                neighbor.parent = parent_candidate
+                neighbor.G = tentative_G
+                # Push an updated entry; old one will be skipped when popped (closed-set guards this).
+                heapq.heappush(pq, (neighbor.F, neighbor.H, next(_tie), neighbor))
+
+    raise ValueError("No path found")
+
+# ---- Movement --------------------------------------------------------------
+
+def jump_loop(path_ref):
+    last_jump_time = 0
+    while True:
+        time.sleep(0.01)
+        now = time.time()
+        if now - last_jump_time < 0.25 or not path_ref or not path_ref[0]:
+            continue
+
+        px, py, pz = map(float, minescript.player_position())
+        foot_y = math.floor(py)
+
+        # nearest point in XY (ignoring Y for lateral guidance)
+        path = path_ref[0]
+        nearest_index = min(
+            range(len(path)),
+            key=lambda i: (px - (path[i][0] + 0.5)) ** 2 + (pz - (path[i][2] + 0.5)) ** 2
+        )
+
+        # next higher waypoint relative to the player's current foot height
+        nxt = next((p for p in path[nearest_index:] if p[1] > math.floor(py)), None)
+        if not nxt:
+            continue
+
+        dx, dz = px - nxt[0], pz - nxt[2]
+        dy = nxt[1] - py
+        if dx*dx + dy*dy + dz*dz <= 4 and dy > 0:
+            block_below = minescript.getblock(math.floor(px), foot_y - 1, math.floor(pz))
+            # jump only if standing on something solid (avoid jumping in air/liquid)
+            if is_supportive(block_below):
+                minescript.player_press_jump(True)
+                time.sleep(0.35)
+                minescript.player_press_jump(False)
+                last_jump_time = time.time()
+
+def _horizontal_dist(p, q):
+    return math.hypot(q[0]-p[0], q[2]-p[2])
+
+def _wrap_deg(a: float) -> float:
+    """Wrap to [-180, 180)."""
+    return (a + 180.0) % 360.0 - 180.0
+
+def _angle_between_flat(u, v) -> float:
+    """Angle in degrees between two horizontal vectors u and v (ignores Y)."""
+    ux, uz = u[0], u[2]
+    vx, vz = v[0], v[2]
+    nu = math.hypot(ux, uz)
+    nv = math.hypot(vx, vz)
+    if nu < 1e-6 or nv < 1e-6:
+        return 0.0
+    dot = (ux*vx + uz*vz) / (nu*nv)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+def _compute_urgency(
+    p, a, b, c_or_none,
+    yaw_now, pitch_now, yaw_target, pitch_target,
+    *,
+    full_at: float = 2.0,        # distance for "forward" urgency to reach 1 (only when badly mis-aimed)
+    turn_full: float = 35.0,     # turn angle where straight-chain damper stops damping
+    pitch_full: float = 25.0,    # pitch error where pitch damper stops damping
+    turn_boost_deg: float = 35.0,# start anticipating turns of at least this size
+    offaxis_full: float = 1,  # lateral miss (in blocks) for full off-axis urgency
+    straight_relax: float = 0.35 # min factor on long straights (0.45..1 range)
+):
+    """
+    Urgency in [0,1] that stays *low* on long straights when you're already aligned.
+    Core idea: distance alone shouldn't spike urgency unless you're off-axis or a turn is imminent.
+    """
+
+    def clamp01(x): 
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+    # --- Geometry / errors ---
+    d = _horizontal_dist(p, b)
+    yaw_err_deg = abs(_wrap_deg(yaw_target - yaw_now))
+    yaw_unit = clamp01(yaw_err_deg / 30.0)  # 30° => full yaw urgency
+
+    # Lateral (off-axis) miss relative to where we're currently looking.
+    # If you're perfectly aligned, this is ~0 even for large d.
+    lateral_err = d * math.sin(math.radians(yaw_err_deg))
+    urg_offaxis = clamp01(lateral_err / max(1e-6, offaxis_full))
+
+    # Forward distance urgency is *gated by yaw error*: when aligned it contributes only a small base.
+    s = clamp01(d / max(1e-6, full_at))
+    # 15% baseline when aligned, rising toward full as yaw error grows.
+    urg_forward = s * (0.15 + 0.85 * yaw_unit)
+
+    # Base urgency prefers "need to rotate" over "far but already aligned".
+    base = max(urg_offaxis, yaw_unit, urg_forward)
+
+    # --- Turn anticipation (lookahead b->c) ---
+    turn_gain = 1.0
+    turn_deg = 0.0
+    if c_or_none is not None:
+        v1 = (b[0]-a[0], b[1]-a[1], b[2]-a[2])
+        v2 = (c_or_none[0]-b[0], c_or_none[1]-b[1], c_or_none[2]-b[2])
+        turn_deg = _angle_between_flat(v1, v2)
+        # Only boost if a real turn is coming *and* we're close enough that looking early helps.
+        if turn_deg >= turn_boost_deg and 0.6 <= d <= 3.0:
+            turn_gain = 1.0 + min(0.30, (turn_deg - turn_boost_deg) / 90.0)
+
+    # --- Dampers ---
+    # Straight-chain damper: strong on long straights, fades out by ~turn_full degrees.
+    if c_or_none is not None:
+        straight_factor = straight_relax + (1.0 - straight_relax) * clamp01(turn_deg / max(1e-6, turn_full))
+    else:
+        straight_factor = 1.0
+
+    # Pitch damper: barely trims when pitch is already good.
+    pitch_err = abs(pitch_target - pitch_now)
+    pitch_mix = 0.8 + 0.2 * clamp01(pitch_err / max(1e-6, pitch_full))  # 0.8..1.0
+
+    # --- Combine ---
+    urg = base * turn_gain * straight_factor * pitch_mix
+
+    # NOTE: removed the old "force high urgency when far" and distance floors.
+    # That was the main reason urgency stayed high on long straight chains.
+
+    return clamp01(urg)
+
+# -- pathing -------------------------------------------------------------------
+from typing import List, Tuple, Optional
+
+
+Vec3 = Tuple[float, float, float]
+Block = Tuple[float, float, float]
+
+def _center(b: Block) -> Vec3:
+    x, y, z = b
+    return (x + 0.5, y, z + 0.5)
+
+def _sub(a: Vec3, b: Vec3) -> Vec3:
+    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+
+def _add(a: Vec3, b: Vec3) -> Vec3:
+    return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
+
+def _mul(a: Vec3, s: float) -> Vec3:
+    return (a[0]*s, a[1]*s, a[2]*s)
+
+def _dot(a: Vec3, b: Vec3) -> float:
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+def _len(a: Vec3) -> float:
+    return math.sqrt(_dot(a, a))
+
+def _norm(a: Vec3) -> Vec3:
+    L = _len(a)
+    return (0.0, 0.0, 0.0) if L == 0.0 else (a[0]/L, a[1]/L, a[2]/L)
+
+def _closest_point_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Tuple[Vec3, float]:
+    """Return (closest_point, t) where t in [0,1] along AB (XZ-plane weighted, mild Y)."""
+    ab = (b[0]-a[0], (b[1]-a[1])*0.25, b[2]-a[2])  # de-emphasize Y for ground nav
+    ap = (p[0]-a[0], (p[1]-a[1])*0.25, p[2]-a[2])
+    ab2 = _dot(ab, ab)
+    t = 0.0 if ab2 == 0 else max(0.0, min(1.0, _dot(ap, ab)/ab2))
+    return _add(a, _mul(ab, t)), t
+
+def _advance_along_path(points: List[Vec3], idx: int, t: float, ds: float) -> Tuple[int, float, Vec3]:
+    """
+    Move forward ds along the polyline starting from segment (idx, t).
+    Returns (new_idx, new_t, position).
+    """
+    i, u = idx, t
+    pos = None
+    while ds > 0 and i < len(points)-1:
+        a, b = points[i], points[i+1]
+        seg = _sub(b, a)
+        seg_len = _len(seg)
+        if seg_len == 0:
+            i += 1
+            u = 0.0
+            continue
+        rem = (1.0 - u) * seg_len
+        if ds < rem:
+            u += ds / seg_len
+            pos = _add(a, _mul(seg, u))
+            ds = 0
+        else:
+            ds -= rem
+            i += 1
+            u = 0.0
+            pos = b
+    if pos is None:
+        pos = points[min(i, len(points)-1)]
+    return i, u, pos
+
+def path_walk_to(
+    goal: Optional[Tuple[float, float, float]] = None,
+    path: Optional[List[Block]] = None,
+    distance: float = 2.5,
+    look_ahead: int = 1,          # kept for API compatibility (unused in new logic)
+    lookahead_distance: float = 2.5,  # pure-pursuit radius in blocks
+    accel: float = 0.20,
+    min_threshold: float = 0.05,
+    max_pitch_down: float = 35.0,     # don't stare too far down
+):
+    """
+    Improved path follower with:
+    - projection-based segment advancement (prevents circling back)
+    - pure-pursuit target at arc-length 'lookahead_distance'
+    - movement computed from geometry (not current view), so smoothed 'look' can't induce loops
+    """
+    # Start/keep jump helper
+    if not getattr(path_walk_to, "_jump_running", False):
+        path_ref = [None]
+        path_walk_to._path_ref = path_ref
+        # threading.Thread(target=jump_loop, args=(path_ref,), daemon=True).start()
+        path_walk_to._jump_running = True
+    else:
+        path_ref = path_walk_to._path_ref
+
+    # Acquire path
+    if path is None:
+        if goal is None:
+            return
+        start = tuple(map(float, minescript.player_position()))
+        path = path_find(start, goal)
+
+    # Pre-center nodes once
+    centers: List[Vec3] = [ _center(b) for b in path ]
+    if not centers:
+        return
+
+    # publish for jump loop
+    path_ref[0] = path
+
+    # State along polyline: segment index i and param t in [0,1]
+    i = 0
+    t = 0.0
+
+    # Vel smoothing
+    forward_v = 0.0
+    strafe_v  = 0.0
+
+    # Stop when within 'distance' of final target
+    final_target = centers[-1]
+
+    # Small hysteresis radius for node passing
+    pass_eps = max(0.35, distance * 0.35)
+
+    urg_ema = 0.0
+    # more responsive than before
+    urg_alpha_up = 0.45   # how fast we ramp up when we need urgency
+    urg_alpha_dn = 0.22   # slower decay
+    # allow quick increases, limit how fast we drop
+    urg_delta_up_cap = 0.35
+    urg_delta_dn_cap = 0.15
+
+
+    while True:
+        px, py, pz = map(float, minescript.player_position())
+        p = (px, py, pz)
+
+        # Goal reached?
+        if _len(_sub(final_target, p)) <= max(distance, 0.75):
+            break
+
+        # Ensure valid segment
+        if i >= len(centers) - 1:
+            # We're on (last node, none). Snap to last and finish.
+            i = len(centers) - 2
+            t = 1.0
+
+        a, b = centers[i], centers[i+1]
+
+        # Closest point on current segment; if past the end, advance segment.
+        closest, t_on = _closest_point_on_segment(p, a, b)
+        if t_on >= 1.0 - 1e-4:
+            # We are at/past this segment end; advance if more segments remain
+            if i < len(centers) - 2:
+                i += 1
+                t = 0.0
+                continue
+            else:
+                # last segment, keep t
+                t = 1.0
+        else:
+            t = max(t, t_on)  # never move backward along the segment
+
+        # If we are clearly past the *node center* too, apply an extra pass condition
+        if _len(_sub(b, p)) + pass_eps < _len(_sub(a, p)):
+            # Player is closer to next node than current — allow advancing
+            if i < len(centers) - 2:
+                i += 1
+                t = 0.0
+
+        # Pure pursuit: lookahead arc-length from our (i,t) state
+        li, lt, target = _advance_along_path(centers, i, t, lookahead_distance)
+
+        # Compute desired yaw/pitch to target (cap pitch)
+        to = _sub(target, p)
+        flat = math.hypot(to[0], to[2])
+        yaw = math.degrees(math.atan2(to[2], to[0])) - 90.0
+        pitch = -math.degrees(math.atan2(to[1], max(1e-6, flat)))
+        pitch = max(-max_pitch_down, min(60.0, pitch))  # clamp
+
+        # --- Adaptive urgency ---
+        # Next-next node (for turn anticipation), if available:
+        c = centers[i+2] if (i + 2) < len(centers) else None
+        yaw_now, pitch_now = minescript.player_orientation()
+
+        urgent_val_raw = _compute_urgency(
+            p=p, a=a, b=b, c_or_none=c,
+            yaw_now=yaw_now, pitch_now=pitch_now,
+            yaw_target=yaw, pitch_target=pitch,
+            full_at=2.0,        # 100% urgency by 2 blocks
+            turn_full=35.0,     # straight-chain mix reaches 1 by ~45°
+            pitch_full=25.0,    # pitch mix reaches 1 by ~15°
+            turn_boost_deg=35.0 # anticipate turns ≥ ~35°
+        )
+
+        # Asymmetric EMA (fast up, slow down) with per-frame delta caps
+        delta = urgent_val_raw - urg_ema
+        if delta >= 0.0:
+            delta = min(delta, urg_delta_up_cap)
+            urg_ema = urg_ema + delta * urg_alpha_up
+        else:
+            delta = max(delta, -urg_delta_dn_cap)
+            urg_ema = urg_ema + delta * urg_alpha_dn
+
+        urgent_val = max(0.0, min(1.0, urg_ema))
+
+        # Apply look with adaptive urgency
+        # minescript.echo("Urgency: {:.3f} (raw {:.3f})".format(urgent_val, urgent_val_raw))
+        look(yaw, pitch, urgent=urgent_val)
+
+        # Movement: drive towards *target direction*, independent of camera smoothing
+        move_dir = _norm((to[0], 0.0, to[2]))  # keep ground movement planar
+        if move_dir == (0.0, 0.0, 0.0):
+            # Avoid division issues at target; release keys
+            minescript.player_press_forward(False)
+            minescript.player_press_backward(False)
+            minescript.player_press_left(False)
+            minescript.player_press_right(False)
+            continue
+
+        # Derive forward/right from desired yaw (not current camera to avoid feedback loop)
+        yaw_rad = math.radians(yaw + 90.0)
+        forward_dir = (math.cos(yaw_rad), 0.0, math.sin(yaw_rad))
+        right_dir   = (math.sin(yaw_rad), 0.0, -math.cos(yaw_rad))
+
+        forward_target = _dot(forward_dir, move_dir)
+        strafe_target  = _dot(right_dir,   move_dir)
+
+        forward_v += (forward_target - forward_v) * accel
+        strafe_v  += (strafe_target  - strafe_v ) * accel
+
+        # Deadzone & key presses
+        fpos = forward_v >  min_threshold
+        fneg = forward_v < -min_threshold
+        spos = strafe_v  >  min_threshold
+        sneg = strafe_v  < -min_threshold
+
+        minescript.player_press_forward(fpos)
+        minescript.player_press_backward(fneg)
+        minescript.player_press_left(sneg)
+        minescript.player_press_right(spos)
+
+    # Release keys at the end
+    minescript.player_press_forward(False)
+    minescript.player_press_backward(False)
+    minescript.player_press_left(False)
+    minescript.player_press_right(False)
