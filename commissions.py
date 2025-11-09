@@ -5,7 +5,6 @@ from rotation import look
 from ThetaStar import path_walk_to, path_find
 from blockRenderer import render_blocks, stop_rendering
 from raycast import raycast_block_subregions
-from collections import deque
 import threading, time, math, random, re
 
 ClickType = JavaClass("net.minecraft.world.inventory.ClickType")
@@ -367,3 +366,4 @@ if __name__ == "__main__":
             minescript.execute("/warp forge")
             commissions_list = get_commissions()
         time.sleep(0.5)
+
