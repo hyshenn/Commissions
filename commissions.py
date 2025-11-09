@@ -5,7 +5,8 @@ from rotation import look
 from ThetaStar import path_walk_to, path_find
 from blockRenderer import render_blocks, stop_rendering
 from raycast import raycast_block_subregions
-import threading, time, math, random
+from concurrent.futures import ThreadPoolExecutor
+import threading, time, math, random, re
 
 ClickType = JavaClass("net.minecraft.world.inventory.ClickType")
 Minecraft = JavaClass("net.minecraft.client.Minecraft")
@@ -20,17 +21,18 @@ BLOCK_LIST = [
 ]
 
 AREA_LIST = {
-    (-88, 147, -14): "Rampart's Quarry",
+    (-90, 147, -14): "Rampart's Quarry",
     (-126, 172, -76): "Upper Mines",
     (52, 198, -25): "Lava Springs",
     (149, 150, 30): "Royal Mines",
     (25, 129, 33): "Cliffside Veins",
+    (23, 145, -26): "generic",
     (-7, 128, 160): "glacite",
     (-135, 144, 141): "goblin"
 }
 
 EATHER_WARPS = {
-    "Lava Springs": [(31, 196, -10)],
+    "Lava Springs": [(30, 193, -8)],
     "Upper Mines": [(-33, 174, -31), (-66, 222, -50), (-114, 196, -30)]
 }
 
@@ -92,7 +94,7 @@ def travel_to_commission(area_name):
         if not positions:
             return
         render_blocks(positions)
-        minescript.player_inventory_select_slot(8)
+        minescript.player_inventory_select_slot(7)
         for wx, wy, wz in positions:
             minescript.player_press_sneak(True)
             time.sleep(0.2)
@@ -111,7 +113,7 @@ def travel_to_commission(area_name):
         for point in pre_points:
             path = path_find(minescript.player_position(), point)
             render_blocks(path_helper(path))
-            path_walk_to(path=path)
+            path_walk_to(path=path, distance=2)
             stop_rendering()
             time.sleep(1)
         if go_to_area:
@@ -119,7 +121,7 @@ def travel_to_commission(area_name):
                 if name == area_name:
                     path = path_find(minescript.player_position(), pos)
                     render_blocks(path_helper(path))
-                    path_walk_to(path=path)
+                    path_walk_to(path=path, distance=2)
                     stop_rendering()
                     return
     if area_name == "Lava Springs":
@@ -136,8 +138,10 @@ def travel_to_commission(area_name):
         go(area_name, pre_points=[(47, 136, 19)])
     elif area_name == "Rampart's Quarry":
         go(area_name)
+    elif area_name == "generic":
+        go("generic")
     elif area_name == "glacite":
-        minescript.player_inventory_select_slot(4)
+        minescript.player_inventory_select_slot(0)
         go(area_name, pre_points=[(61, 135, 29), (0, 128, 66)], go_to_area=False)
         go(area_name)
     elif area_name == "goblin":
@@ -160,12 +164,13 @@ def claim_commissions():
                 container_menu.containerId,
                 slot,
                 mouse_button,
-                ClickType.QUICK_MOVE,
+                ClickType.PICKUP,
                 Minecraft.getInstance().player
             )
             time.sleep(0.5)
-        except:
+        except Exception:
             pass
+    Minecraft.getInstance().player.closeContainer()
 
 def kill_commission():
     commission_list_lower = [c.lower() for c in commissions_list]
@@ -175,10 +180,6 @@ def kill_commission():
     )
     if not target_type:
         return
-    if target_type == "glacite":
-        target_type = "Glacite Walker"
-    elif target_type == "goblin":
-        target_type = "Goblin"
     look_lock = threading.Lock()
     current_look = [None]
     look_thread = [None]
@@ -199,8 +200,7 @@ def kill_commission():
                 yaw, pitch = target
                 look(yaw, pitch)
             else:
-                time.sleep(0.05)
-            time.sleep(0.01)
+                time.sleep(0.01)
     def start_look_thread():
         if look_thread[0] is None or not look_thread[0].is_alive():
             look_thread[0] = threading.Thread(target=thread_look, daemon=True)
@@ -208,44 +208,53 @@ def kill_commission():
     def stop_look_thread():
         look_thread_running[0] = False
     start_look_thread()
-    available_entities = []
-    target_entities = minescript.entities(max_distance=100)
-    for t_entity in target_entities:
-        if target_type.lower() in t_entity.name.lower():
-            available_entities.append(t_entity)
-    if not available_entities:
-        return
-    px, py, pz = minescript.player_position()
-    available_entities.sort(key=lambda e: (e.position[0]-px)**2 + (e.position[1]-py)**2 + (e.position[2]-pz)**2)
-    for entity in available_entities:
-        while not stop_threads.is_set():
-            entities = minescript.entities(max_distance=100)
-            live = next((e for e in entities if e.uuid == entity.uuid), None)
-            if not live or live.health <= 0:
-                with look_lock:
-                    current_look[0] = None
-                break
-            px, py, pz = minescript.player_position()
-            ex, ey, ez = live.position
-            dist_sq = (px - ex) ** 2 + (py - ey) ** 2 + (pz - ez) ** 2
-            if dist_sq > 3:
-                path_walk_to(live.position, distance=1.5)
-                with look_lock:
-                    current_look[0] = None
-            else:
-                yaw, pitch = calc_look(px, py, pz, ex, ey, ez)
-                with look_lock:
-                    current_look[0] = (yaw, pitch)
-                minescript.player_press_attack(True)
-                time.sleep(1 / random.uniform(8, 11))
-                minescript.player_press_attack(False)
-            time.sleep(0.05)
-    with look_lock:
-        current_look[0] = None
+    while not stop_threads.is_set():
+        entities = minescript.entities(max_distance=100)
+        available_entities = [e for e in entities if target_type.lower() in e.name.lower()]
+        if not available_entities:
+            with look_lock:
+                current_look[0] = None
+            time.sleep(0.5)
+            continue
+        px, py, pz = minescript.player_position()
+        available_entities.sort(key=lambda e: (e.position[0]-px)**2 + (e.position[1]-py)**2 + (e.position[2]-pz)**2)
+        target = available_entities[0]
+        live = next((e for e in entities if e.uuid == target.uuid), None)
+        if not live or live.position is None:
+            with look_lock:
+                current_look[0] = None
+            time.sleep(0.2)
+            continue
+        px, py, pz = minescript.player_position()
+        ex, ey, ez = live.position
+        dist_sq = (px - ex)**2 + (py - ey)**2 + (pz - ez)**2
+        display = str(live)
+        health_match = re.search(r"(\d+)\s*/\s*(\d+)", display)
+        if health_match:
+            current, maximum = health_match.groups()
+        else:
+            current, maximum = "0", "0"
+        if int(current) <= 0:
+            with look_lock:
+                current_look[0] = None
+            time.sleep(0.2)
+            continue
+        if dist_sq > 9:
+            path_walk_to((ex, ey-1, ez), distance=1.5)
+            with look_lock:
+                current_look[0] = None
+        else:
+            yaw, pitch = calc_look(px, py, pz, ex, ey-0.5, ez)
+            with look_lock:
+                current_look[0] = (yaw, pitch)
+            minescript.player_press_attack(True)
+            time.sleep(1 / random.uniform(8, 11))
+            minescript.player_press_attack(False)
+        time.sleep(0.05)
     stop_look_thread()
 
 def mining():
-    minescript.player_inventory_select_slot(4)
+    minescript.player_inventory_select_slot(0)
     available_blocks, available_angles = [], []
     current_blocks, current_angles = [], []
     detector = Detection(BLOCK_LIST, 3, 25)
@@ -259,6 +268,8 @@ def mining():
             if angles: available_angles[:] = angles
             time.sleep(1.5)
     threading.Thread(target=scan_blocks, daemon=True).start()
+    minescript.player_press_use(True)
+    minescript.player_press_use(False)
     while not stop_threads.is_set():
         if not current_blocks and available_blocks:
             current_blocks[:] = available_blocks[:]
@@ -306,23 +317,25 @@ if __name__ == "__main__":
             minescript.echo("Waiting for commissions...")
             time.sleep(2)
             continue
-        for commission in commissions_list:
+        for commission in commissions_list.copy():
             commission_lower = commission.lower()
             if any(k in commission_lower for k in ["mithril", "titanium"]):
                 commission_type = "Miner"
                 key = "mithril" if "mithril" in commission_lower else "titanium"
+                matched_area = next((a for a in AREA_LIST.values() if a.lower() in commission_lower), None)
+                area = matched_area if matched_area else "generic"
             elif any(k in commission_lower for k in ["goblin", "glacite"]):
                 commission_type = "Slayer"
                 key = "goblin" if "goblin" in commission_lower else "glacite"
+                area = next((a for a in AREA_LIST.values() if a.lower() in commission_lower), None)
             else:
                 minescript.echo(f"Skipping unknown commission: {commission}")
                 continue
-            area = next((a for a in AREA_LIST.values() if a.lower() in commission_lower), None)
-            travel_to_commission(area)
             percent_container = [extract_percent(commission)]
+            minescript.echo(f"Starting {commission_type} commission: {commission} ({percent_container[0]})")
+            travel_to_commission(area)
             stop_threads.clear()
             threading.Thread(target=lambda: threaded_monitor(key, percent_container), daemon=True).start()
-            minescript.echo(f"Starting {commission_type} commission: {commission} ({percent_container[0]})")
             time.sleep(2.5)
             if commission_type == "Miner":
                 threading.Thread(target=mining, daemon=True).start()
@@ -333,6 +346,7 @@ if __name__ == "__main__":
             stop_threads.set()
             stop_rendering()
             minescript.player_press_attack(False)
+            minescript.player_press_forward(False)
             time.sleep(1)
             minescript.execute("/warp forge")
             time.sleep(5)
@@ -350,4 +364,6 @@ if __name__ == "__main__":
             time.sleep(1)
             claim_commissions()
             minescript.echo(f"Finished {commission_type} commission: {commission} (DONE)")
-        time.sleep(1)
+            minescript.execute("/warp forge")
+            commissions_list = get_commissions()
+        time.sleep(0.5)
