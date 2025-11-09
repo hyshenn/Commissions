@@ -2,7 +2,6 @@ from typing import Tuple, List, Dict, Optional
 from system.lib import minescript
 from raycast import raycast_block_subregions
 import math
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 AIRLIKE: set[str] = {"minecraft:air", "minecraft:light"}
@@ -101,3 +100,4 @@ class Detection:
                 if abs(nx-start_pos[0]) + abs(ny-start_pos[1]) + abs(nz-start_pos[2]) <= max_radius:
                     queue.append((nx, ny, nz))
         return None
+
