@@ -5,7 +5,7 @@ from rotation import look
 from ThetaStar import path_walk_to, path_find
 from blockRenderer import render_blocks, stop_rendering
 from raycast import raycast_block_subregions
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 import threading, time, math, random, re
 
 ClickType = JavaClass("net.minecraft.world.inventory.ClickType")
@@ -22,7 +22,7 @@ BLOCK_LIST = [
 
 AREA_LIST = {
     (-90, 147, -14): "Rampart's Quarry",
-    (-126, 172, -76): "Upper Mines",
+    (-124, 171, -77): "Upper Mines",
     (52, 198, -25): "Lava Springs",
     (149, 150, 30): "Royal Mines",
     (25, 129, 33): "Cliffside Veins",
