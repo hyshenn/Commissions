@@ -40,6 +40,56 @@ EMISSARY = (42, 135, 22)
 commissions_list = []
 stop_threads = threading.Event()
 
+class Interruption:
+    def __init__(self):
+        self.PLAYER_RADIUS = 4
+        self.NEXT_VEIN_RADIUS = 6
+
+    def nearest_player_info(self):
+        px, py, pz = minescript.player_position()
+        nearest = None
+        min_dist = self.PLAYER_RADIUS + 1
+        for player in minescript.players(max_distance=self.PLAYER_RADIUS):
+            if player.id == minescript.player().id:
+                continue
+            x, y, z = player.position
+            dist = abs(x - px) + abs(y - py) + abs(z - pz)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = player
+        if nearest:
+            return nearest, min_dist
+        return None, None
+
+    def get_safe_pos(self):
+        detector = Detection(BLOCK_LIST, self.NEXT_VEIN_RADIUS, 5)
+        blocks, _ = detector.locate_blocks()
+        if not blocks:
+            return None
+        px, py, pz = tuple(minescript.player_position())
+        furthest_block = max(blocks, key=lambda pos: abs(pos[0]-px)+abs(pos[1]-py)+abs(pos[2]-pz))
+        safe_pos = detector.find_nearest_safe(furthest_block, 2)
+        if not safe_pos or not hasattr(safe_pos, "__iter__") or len(safe_pos) != 3 or any(c is None for c in safe_pos):
+            return None
+        return tuple(int(c) for c in safe_pos)
+
+    def handle_player(self):
+        player, dist = self.nearest_player_info()
+        if player:
+            minescript.echo(f"Player detected: {player.name} at radius {dist:.2f}")
+            safe_pos = self.get_safe_pos()
+            if safe_pos:
+                stop_rendering()
+                minescript.player_press_attack(False)
+                minescript.echo(f"Walking to safe position at {safe_pos}")
+                path = path_find(tuple(map(int, minescript.player_position())), safe_pos)
+                render_blocks(path_helper(path))
+                path_walk_to(path=path, distance=1.5)
+                stop_rendering()
+                px, py, pz = minescript.player_position()
+                return True
+        return False
+
 def commissions_helper_thread():
     global commissions_list
     while True:
@@ -256,7 +306,8 @@ def mining():
     minescript.player_inventory_select_slot(0)
     available_blocks, available_angles = [], []
     current_blocks, current_angles = [], []
-    detector = Detection(BLOCK_LIST, 3, 25)
+    detector = Detection(BLOCK_LIST, 3, 5)
+    interruption = Interruption()
     def scan_blocks():
         nonlocal available_blocks, available_angles
         while not stop_threads.is_set():
@@ -267,9 +318,9 @@ def mining():
             if angles: available_angles[:] = angles
             time.sleep(1.5)
     threading.Thread(target=scan_blocks, daemon=True).start()
-    minescript.player_press_use(True)
-    minescript.player_press_use(False)
     while not stop_threads.is_set():
+        if interruption.handle_player():
+            continue
         if not current_blocks and available_blocks:
             current_blocks[:] = available_blocks[:]
             current_angles[:] = available_angles[:]
@@ -289,6 +340,8 @@ def mining():
                 if stop_threads.is_set():
                     stop_rendering(remove_blocks=[block])
                     return
+                if interruption.handle_player():
+                    break
                 minescript.player_press_attack(True)
                 time.sleep(0.01)
             stop_rendering(remove_blocks=[block])
@@ -366,4 +419,3 @@ if __name__ == "__main__":
             minescript.execute("/warp forge")
             commissions_list = get_commissions()
         time.sleep(0.5)
-
